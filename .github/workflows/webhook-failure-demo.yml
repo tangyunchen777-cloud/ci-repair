@@ -1,0 +1,20 @@
+name: Webhook failure demo
+
+on:
+  push:
+    branches:
+      - demo/webhook-failure
+
+permissions:
+  contents: read
+
+jobs:
+  intentional-failure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Produce a controlled CI failure
+        run: |
+          echo "Intentional failure for ci-repair webhook delivery verification."
+          echo "Expected: workflow_run completed/failure is accepted and normalized in Railway deploy logs."
+          exit 1
