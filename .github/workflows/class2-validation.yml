@@ -1,0 +1,38 @@
+name: Class 2 Docker validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build Python 3.12 image
+        run: docker build -t ci-repair:class2 .
+      - name: Run pytest inside a temporary container
+        run: docker run --rm ci-repair:class2 python -m pytest -q -p no:cacheprovider
+      - name: Verify PORT=8080, health, and webhook ping from runner host
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --rm --name ci-repair-class2 -e PORT=8080 -p 8080:8080 ci-repair:class2
+          trap 'docker logs ci-repair-class2; docker stop ci-repair-class2' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:8080/health >/dev/null; then break; fi
+            sleep 1
+          done
+          health_status=$(curl --silent --show-error -o /tmp/health.json -w '%{http_code}' http://localhost:8080/health)
+          test "$health_status" = 200
+          test "$(cat /tmp/health.json)" = '{"status":"ok"}'
+          cat /tmp/health.json
+          ping_status=$(curl --silent --show-error -o /tmp/ping.json -w '%{http_code}' -X POST http://localhost:8080/webhook -H 'Content-Type: application/json' -H 'X-GitHub-Event: ping' -H 'X-GitHub-Delivery: ci-ping-001' --data '{}')
+          test "$ping_status" = 200
+          test "$(cat /tmp/ping.json)" = '{"status":"ok","event":"ping"}'
+          cat /tmp/ping.json
