@@ -1,0 +1,21 @@
+{
+  "action": "completed",
+  "repository": {
+    "full_name": "octocat/ci-repair-example",
+    "private": true
+  },
+  "workflow_run": {
+    "id": 123,
+    "name": "CI",
+    "html_url": "https://github.com/octocat/ci-repair-example/actions/runs/123",
+    "head_branch": "feature/repair",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "conclusion": "failure",
+    "updated_at": "2026-10-14T18:30:00Z",
+    "status": "completed",
+    "logs_url": "https://api.github.com/repos/octocat/ci-repair-example/actions/runs/123/logs"
+  },
+  "sender": {
+    "login": "unused-payload-sentinel"
+  }
+}
