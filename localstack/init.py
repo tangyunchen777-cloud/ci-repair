@@ -6,9 +6,9 @@ from pathlib import Path
 import boto3
 
 region = os.environ["AWS_DEFAULT_REGION"]
-credentials = {"aws_access_key_id": "test", "aws_secret_access_key": "test"}
-sqs = boto3.client("sqs", region_name=region, endpoint_url="http://localhost:4566", **credentials)
-s3 = boto3.client("s3", region_name=region, endpoint_url="http://localhost:4566", **credentials)
+endpoint = os.environ["BOOTSTRAP_AWS_ENDPOINT_URL"]
+sqs = boto3.client("sqs", region_name=region, endpoint_url=endpoint)
+s3 = boto3.client("s3", region_name=region, endpoint_url=endpoint)
 dlq = sqs.create_queue(QueueName=os.environ["SQS_DLQ_NAME"], Attributes={"MessageRetentionPeriod": "1209600"})["QueueUrl"]
 arn = sqs.get_queue_attributes(QueueUrl=dlq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
 sqs.create_queue(QueueName=os.environ["SQS_QUEUE_NAME"], Attributes={
