@@ -7,7 +7,10 @@ WORKDIR /service
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY worker ./worker
 COPY tests ./tests
+COPY alembic ./alembic
+COPY alembic.ini pytest.ini ./
 
 USER 10001:10001
 EXPOSE 8000
