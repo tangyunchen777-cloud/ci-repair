@@ -35,6 +35,7 @@ async def test_authenticated_api_redirect_has_no_token_on_blob(failure):
 
     def handler(request):
         requests.append(request)
+        assert request.headers["Accept-Encoding"] == "identity"
         if len(requests) == 1:
             assert request.headers["Authorization"] == "Bearer do-not-leak"
             assert request.headers["Accept"] == "application/vnd.github+json"
