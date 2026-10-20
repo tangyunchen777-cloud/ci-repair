@@ -29,7 +29,7 @@ class GitHubLogs:
             "X-GitHub-Api-Version": self.settings.github_api_version,
         }
         async with httpx.AsyncClient(timeout=timeout, transport=self.transport, follow_redirects=False,
-                                     trust_env=False) as client:
+                                     trust_env=False, headers={"Accept-Encoding": "identity"}) as client:
             async with client.stream("GET", expected, headers=headers) as response:
                 if response.status_code == 200:
                     return await self._bounded(response)
