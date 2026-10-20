@@ -1,13 +1,49 @@
 import json
 import logging
+import asyncio
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import ValidationError
 
 from app.models import FAILURE_CONCLUSIONS, WorkflowRunPayload, normalize_failure
+from app.config import get_settings
+from app.db import make_engine, make_sessions
+from app.adapters.aws import aws_client
+from app.adapters.sqs import SQSQueue
+from app.repositories.failure_jobs import FailureJobRepository
+from app.services.ingestion import IngestionService, IngestionUnavailable
 
-app = FastAPI(title="ci-repair")
+
+@asynccontextmanager
+async def lifespan(app):
+    settings = get_settings()
+    engine, client = None, None
+    app.state.ingestion = None
+    try:
+        if settings.database_url and settings.aws_region and settings.sqs_queue_url:
+            engine = make_engine(settings)
+            client = await asyncio.to_thread(aws_client, "sqs", settings)
+            app.state.ingestion = IngestionService(
+                FailureJobRepository(make_sessions(engine)), SQSQueue(client, settings.sqs_queue_url),
+                settings.enqueue_lease_seconds,
+            )
+        yield
+    finally:
+        if engine:
+            await engine.dispose()
+        if client:
+            await asyncio.to_thread(client.close)
+
+
+app = FastAPI(title="ci-repair", lifespan=lifespan)
+
+
+def get_ingestion(request: Request):
+    if request.app.state.ingestion is None:
+        raise IngestionUnavailable("Durable ingestion is not configured")
+    return request.app.state.ingestion
 
 logger = logging.getLogger("ci_repair.webhook")
 if not logger.handlers:
@@ -56,8 +92,8 @@ async def webhook(
 
     failure = normalize_failure(payload, x_github_delivery)
     logger.info(json.dumps({"event": "workflow_failure_accepted", **failure.model_dump(mode="json")}))
-    # PostgreSQL placeholder — implement in Class 3:
-    # await failure_repository.create(failure)
-    # AWS SQS placeholder — implement in Class 3:
-    # await queue_publisher.publish(failure)
-    return {"status": "accepted", "delivery_id": failure.delivery_id, "run_id": failure.run_id}
+    try:
+        return await get_ingestion(request).ingest(failure)
+    except Exception:
+        # Exception text may contain credentials, SQL parameters, or signed URLs.
+        raise HTTPException(status_code=503, detail="Durable ingestion unavailable; retry delivery") from None
