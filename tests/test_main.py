@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,10 +13,16 @@ from app.models import FailureEvent, WorkflowRunPayload, normalize_failure
 DELIVERY_ID = "72d3162e-cc78-11e3-81ab-4c9367dc0958"
 HEADERS = {"X-GitHub-Event": "workflow_run", "X-GitHub-Delivery": DELIVERY_ID}
 FIXTURE = Path(__file__).parent / "fixtures" / "workflow_run_failure.json"
+JOB_ID = UUID("5fd03462-1fd2-4cc8-98d3-b90914ed1d55")
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    service = SimpleNamespace(ingest=AsyncMock(side_effect=lambda failure: {
+        "status": "accepted", "delivery_id": failure.delivery_id, "run_id": failure.run_id,
+        "job_id": str(JOB_ID),
+    }))
+    monkeypatch.setattr("app.main.get_ingestion", lambda request: service)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -75,9 +84,11 @@ def expected_failure():
     return {
         "delivery_id": DELIVERY_ID,
         "repository_full_name": "octocat/ci-repair-example",
+        "repository_clone_url": "https://github.com/octocat/ci-repair-example.git",
         "workflow_name": "CI",
         "run_id": 123,
         "run_url": "https://github.com/octocat/ci-repair-example/actions/runs/123",
+        "logs_url": "https://api.github.com/repos/octocat/ci-repair-example/actions/runs/123/logs",
         "head_branch": "feature/repair",
         "head_sha": "0123456789abcdef0123456789abcdef01234567",
         "conclusion": "failure",
@@ -90,7 +101,7 @@ def test_accepted_failures_log_only_normalized_metadata(client, payload, caplog,
     payload["workflow_run"]["conclusion"] = conclusion
     response = client.post("/webhook", headers=HEADERS, json=payload)
     assert response.status_code == 200
-    assert response.json() == {"status": "accepted", "delivery_id": DELIVERY_ID, "run_id": 123}
+    assert response.json() == {"status": "accepted", "delivery_id": DELIVERY_ID, "run_id": 123, "job_id": str(JOB_ID)}
     assert len(caplog.records) == 1
     record = json.loads(caplog.records[0].getMessage())
     assert record == {"event": "workflow_failure_accepted", **expected_failure(), "conclusion": conclusion}
@@ -132,9 +143,9 @@ def test_invalid_json(client, caplog, event, body):
 
 
 REQUIRED_PATHS = [
-    ("action",), ("repository",), ("repository", "full_name"), ("workflow_run",),
+    ("action",), ("repository",), ("repository", "full_name"), ("repository", "clone_url"), ("workflow_run",),
     *(("workflow_run", field) for field in (
-        "id", "name", "html_url", "head_branch", "head_sha", "conclusion", "updated_at"
+        "id", "name", "html_url", "logs_url", "head_branch", "head_sha", "conclusion", "updated_at"
     )),
 ]
 
@@ -160,7 +171,8 @@ def test_non_object_workflow_payload(client, body):
 
 @pytest.mark.parametrize("field,value", [
     ("id", "123"), ("id", True), ("id", 0), ("name", ""), ("head_branch", None),
-    ("html_url", "not-a-url"), ("updated_at", "invalid"),
+    ("html_url", "not-a-url"), ("logs_url", "not-a-url"), ("logs_url", "ftp://example.org/logs"),
+    ("updated_at", "invalid"),
     ("updated_at", "2026-10-14T18:30:00"),
 ])
 def test_malformed_workflow_fields(client, payload, caplog, field, value):
@@ -168,3 +180,17 @@ def test_malformed_workflow_fields(client, payload, caplog, field, value):
     response = client.post("/webhook", headers=HEADERS, json=payload)
     assert response.status_code == 422
     assert not caplog.records
+
+
+@pytest.mark.parametrize("value", [None, "", "bad-url", "ftp://example.org/repository"])
+def test_malformed_clone_url(client, payload, value):
+    payload["repository"]["clone_url"] = value
+    assert client.post("/webhook", headers=HEADERS, json=payload).status_code == 422
+
+
+def test_ingestion_failure_is_sanitized(client, payload, monkeypatch):
+    service = SimpleNamespace(ingest=AsyncMock(side_effect=RuntimeError("secret database credential")))
+    monkeypatch.setattr("app.main.get_ingestion", lambda request: service)
+    response = client.post("/webhook", headers=HEADERS, json=payload)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Durable ingestion unavailable; retry delivery"}
