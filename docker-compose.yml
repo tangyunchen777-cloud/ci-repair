@@ -1,0 +1,106 @@
+name: ci-repair-class4
+
+x-app: &app
+  image: ci-repair:class4
+  build: .
+  init: true
+
+x-environment: &environment
+  DATABASE_URL: ${DATABASE_URL:?Copy .env.example to .env first}
+  DATABASE_SSL: ${DATABASE_SSL:-false}
+  AWS_REGION: ${AWS_REGION:?Set AWS_REGION}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set local credentials}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set local credentials}
+  AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:?Set the LocalStack endpoint}
+  SQS_QUEUE_URL: ${SQS_QUEUE_URL:?Set SQS_QUEUE_URL}
+  S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  localstack:
+    image: localstack/localstack:4.10.0
+    environment:
+      SERVICES: sqs,s3
+      AWS_DEFAULT_REGION: ${AWS_REGION:?Set AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set local credentials}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set local credentials}
+      BOOTSTRAP_AWS_ENDPOINT_URL: http://localhost:4566
+      LOCALSTACK_HOST: localstack:4566
+      SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:?Set SQS_QUEUE_NAME}
+      SQS_DLQ_NAME: ${SQS_DLQ_NAME:?Set SQS_DLQ_NAME}
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET}
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - 127.0.0.1:4566:4566
+    volumes:
+      - ./localstack/init.py:/etc/localstack/init/ready.d/10-init.py:ro
+    healthcheck:
+      test: [CMD-SHELL, 'test -f /tmp/ci-repair-ready']
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  migration:
+    <<: *app
+    environment: *environment
+    command: [alembic, upgrade, head]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    environment:
+      <<: *environment
+      PORT: "8080"
+    ports:
+      - 127.0.0.1:8080:8080
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; assert urllib.request.urlopen("http://localhost:8080/health").read() == b''{"status":"ok"}''']
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    <<: *app
+    environment:
+      <<: *environment
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    command: [python, -m, worker.main]
+    stop_grace_period: 4m
+    depends_on:
+      api:
+        condition: service_healthy
+
+  test:
+    <<: *app
+    profiles: [test]
+    environment:
+      <<: *environment
+      RUN_INTEGRATION: "1"
+      TEST_API_URL: http://api:8080
+    command: [python, -m, pytest, -q, -p, "no:cacheprovider"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

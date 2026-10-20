@@ -1,172 +1,387 @@
-# ci-repair — Class 2
+# ci-repair — Class 4 durable ingestion
 
-A small Python 3.12 FastAPI service that receives GitHub webhooks, validates focused
-workflow-run fields, and normalizes completed CI failures into a `FailureEvent`.
-This class implements only the webhook-ingestion boundary, in one application.
+Extends the existing `class2-webhook` implementation. The durable handoff is
+`ready_for_agent`; Class 5 starts LangGraph there. This class does not clone,
+repair, execute target repository tests, call an LLM, create target pull requests,
+or deploy Kubernetes/EKS.
 
-## Intended end-state architecture
+## Architecture and code
 
-GitHub Actions failure → public FastAPI webhook → AWS SQS → long-running worker
-on Kubernetes/EKS → LangGraph (diagnose → retrieve context → generate patch →
-validate, with bounded self-correction) → isolated sandbox → draft pull request
-or human escalation. PostgreSQL will hold operational state; S3 will hold large
-logs and artifacts. The API will produce messages and the worker will consume
-them. Generated changes must never be merged directly to main.
+```mermaid
+flowchart LR
+  GH[GitHub workflow_run] --> API[Railway FastAPI]
+  API --> DB[(PostgreSQL 16 / RDS)]
+  API --> Q[SQS standard queue]
+  Q --> W[Docker worker]
+  W --> LOG[Authenticated GitHub logs download]
+  W --> S3[(Private S3 event + raw ZIP)]
+  W --> DB
+  Q --> DLQ[DLQ after 3 receives]
+  DB --> READY[ready_for_agent]
+```
 
-Only FastAPI ingestion and normalization exist today. There is no queue,
-persistence, worker, code cloning, LLM call, sandbox, GitHub API call, AWS deployment,
-Kubernetes, EKS, Terraform, autoscaling, or dashboard implementation.
+Existing `app/main.py`, `app/models.py`, fixture, exact response tests, Dockerfile,
+requirements and PR workflow are extended. Added:
 
-## HTTP behavior
+```text
+app/config.py, db.py, db_models.py
+app/repositories/failure_jobs.py
+app/services/ingestion.py
+app/adapters/aws.py, sqs.py, s3.py, github.py
+worker/main.py, retry_enqueue.py
+alembic/env.py, versions/0001_repair_jobs.py
+localstack/init.py
+tests/test_contracts.py, test_github.py, test_ingestion.py, test_worker.py
+tests/integration/test_pipeline.py
+docker-compose.yml, .env.example, pytest.ini
+```
 
-`GET /health` returns HTTP 200 and exactly `{"status":"ok"}`.
+One Python 3.12 image serves API, worker, migrations, enqueue recovery, and tests.
+It retains UID/GID 10001 and binds `0.0.0.0:${PORT:-8000}`. boto3 operations in
+async application code run through `asyncio.to_thread`. Settings come from the
+environment; `.env.example` contains disposable local examples, never cloud secrets.
 
-`POST /webhook` requires nonempty `X-GitHub-Event` and `X-GitHub-Delivery` headers
-and valid JSON. Header names are case insensitive.
+## HTTP and normalized contract
 
-| Input | HTTP | JSON response |
+`GET /health` is a liveness check: exactly HTTP 200 `{"status":"ok"}` even if
+durable services are unconfigured. It is not a database/queue readiness guarantee.
+`POST /webhook` still requires nonblank `X-GitHub-Event` and `X-GitHub-Delivery`.
+
+| Input | HTTP | Response |
 | --- | --- | --- |
-| `ping` | 200 | `{"status":"ok","event":"ping"}` |
-| Other event types | 200 | `{"status":"ignored","reason":"unsupported_event"}` |
-| `workflow_run`, action other than `completed` (including `requested` / `in_progress`) | 200 | `{"status":"ignored","reason":"action_not_completed"}` |
-| Completed run with another conclusion (including `success`, `cancelled`, or null) | 200 | `{"status":"ignored","reason":"non_failure_conclusion"}` |
-| Completed run with `failure`, `timed_out`, or `startup_failure` | 200 | `{"status":"accepted","delivery_id":"...","run_id":123}` |
-| Invalid JSON / encoding | 400 | Clear `detail` message |
-| Missing / empty headers or malformed workflow-run fields | 422 | Validation `detail` list |
+| ping | 200 | `{"status":"ok","event":"ping"}` |
+| Unsupported event | 200 | `{"status":"ignored","reason":"unsupported_event"}` |
+| workflow_run action != completed | 200 | `{"status":"ignored","reason":"action_not_completed"}` |
+| Completed nonfailure conclusion | 200 | `{"status":"ignored","reason":"non_failure_conclusion"}` |
+| Completed failure / timed_out / startup_failure | 200 | `{"status":"accepted","delivery_id":"...","run_id":123,"job_id":"UUID"}` |
+| Previously enqueued delivery | 200 | Same identifiers with `"status":"duplicate"` |
+| Invalid JSON / encoding | 400 | Clear detail |
+| Missing headers or invalid focused fields | 422 | Details without input values |
+| DB/SQS unavailable, or concurrent enqueue in progress | 503 | Sanitized retry detail |
 
-All workflow-run payloads must pass schema validation before filtering. Unknown
-GitHub fields are ignored. The required fields are top-level `action`,
-`repository.full_name`, and `workflow_run.id`, `name`, `html_url`, `head_branch`,
-`head_sha`, `conclusion` (nullable), and `updated_at` (timezone required).
+Workflow-run schema validation precedes filtering. Required: `action`,
+`repository.full_name`, `repository.clone_url` (HTTP/S), and `workflow_run.id`
+(strict positive integer), `name`, `html_url`, `logs_url` (HTTP/S), `head_branch`,
+`head_sha`, `conclusion` (nullable), `updated_at` (aware datetime). Unknown GitHub
+fields are ignored. No webhook-secret/HMAC validation is required in this class.
 
-Accepted events produce one JSON log containing only normalized metadata and
-the event label `workflow_failure_accepted`. Full payloads are never logged.
-Validation responses omit payload values. Uvicorn also emits ordinary server
-and access logs. No webhook-secret or HMAC validation is implemented, as required
-for this class. An accepted response means normalized and logged; it does not
-mean durable delivery, deduplication, or repair execution.
+`normalize_failure()` still produces the single `FailureEvent` model. It adds
+`repository_clone_url` from repository.clone_url and `logs_url` from the run.
+`event_timestamp` is run.updated_at. `head_sha` is the exact commit Actions tested.
+The one safe `workflow_failure_accepted` log contains this normalized metadata,
+never the full payload; this log precedes persistence and alone is not success.
 
-## Normalized contract
-
-`app/models.py` defines `FailureEvent`. `run_url` comes from `html_url`;
-`event_timestamp` comes from GitHub's `workflow_run.updated_at`, rather than the
-server receipt time. The contract's JSON serialization is
-`failure.model_dump(mode="json")` (or `failure.model_dump_json()` for a string).
+SQS contains JSON (no credentials):
 
 ```json
 {
-  "delivery_id": "72d3162e-cc78-11e3-81ab-4c9367dc0958",
-  "repository_full_name": "octocat/ci-repair-example",
-  "workflow_name": "CI",
-  "run_id": 123,
-  "run_url": "https://github.com/octocat/ci-repair-example/actions/runs/123",
-  "head_branch": "feature/repair",
-  "head_sha": "0123456789abcdef0123456789abcdef01234567",
-  "conclusion": "failure",
-  "event_timestamp": "2026-10-14T18:30:00Z"
+  "schema_version": 1,
+  "job_id": "5fd03462-1fd2-4cc8-98d3-b90914ed1d55",
+  "failure": {
+    "delivery_id": "example-delivery",
+    "repository_full_name": "octocat/ci-repair-example",
+    "repository_clone_url": "https://github.com/octocat/ci-repair-example.git",
+    "workflow_name": "CI",
+    "run_id": 123,
+    "run_url": "https://github.com/octocat/ci-repair-example/actions/runs/123",
+    "logs_url": "https://api.github.com/repos/octocat/ci-repair-example/actions/runs/123/logs",
+    "head_branch": "feature/repair",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "conclusion": "failure",
+    "event_timestamp": "2026-10-14T18:30:00Z"
+  }
 }
 ```
 
-IDs are positive integers; URLs must be HTTP(S) URLs. Conclusions in the normalized
-contract are limited to the three accepted failure values. All other fields are
-nonempty strings except the timezone-aware event timestamp. Requirements use
-bounded compatible version ranges; they are not an exact dependency lockfile.
+## Transactions, state machine, delivery semantics
 
-## Docker-only local workflow
+`queued -> processing -> ready_for_agent`; failures in a claimed attempt use
+`processing -> retrying -> processing`. `failed` is reserved for an operator's
+terminal decision after DLQ investigation. SQS moving a message to DLQ does not
+itself update PostgreSQL; a job may remain retrying (or processing after a crash).
 
-Prerequisite: Docker with a running Linux container engine. Run commands from
-the repository root. Dependencies are installed only inside the image.
+1. `create_or_get` uses PostgreSQL ON CONFLICT on unique delivery_id and commits.
+   Concurrent deliveries create one UUID job. Duplicate payloads cannot replace
+   its original data. Every repository method owns a short transaction.
+2. A conditional enqueue lease serializes publishers for that job. It commits
+   before SQS I/O, lasts 120 seconds, and is cleared after recording publication
+   or a definite publish error. A competing request receives 503 until it can
+   return duplicate. No transaction/row lock spans a network request.
+3. Publish the persisted job in the versioned envelope. Only after SQS returns
+   do `sqs_message_id` and `enqueued_at` commit, followed by accepted HTTP 200.
+   Publish failure records `sqs_publish_failed`, retains the job, and returns 503.
+4. **Remaining dual-write limitation:** SQS can succeed while its response is
+   lost or the final DB update fails. An expired enqueue lease allows an operator
+   retry/redelivery to publish again. This class has no transactional outbox and
+   does not promise exactly-once publication.
+5. The worker receives one message with a 20-second long poll and 300-second SQS
+   visibility. It validates the envelope, atomically claims a 240-second DB lease,
+   and checks the envelope against durable event data. Outcomes: claimed,
+   already_complete (safe to delete), busy (never delete another active lease).
+   Expired processing leases can be reclaimed; tokens fence stale DB writes.
+6. A bounded 180-second attempt downloads the GitHub ZIP, then writes event JSON
+   and the original ZIP bytes to S3 with SSE-S3 (`AES256`) and application/json /
+   application/zip. No extraction, re-encoding, or raw-log printing occurs.
+7. Only after both uploads does `ready_for_agent` commit with both URIs. Then
+   DeleteMessage acknowledges SQS. A delete failure is safe: the next delivery
+   acknowledges the terminal row without repeating downloads/uploads.
+8. Download/S3/DB failures record a fixed sanitized stage code, increment retry_count,
+   set retrying, and leave the message undeleted. If PostgreSQL itself is down,
+   recording the failure is necessarily best effort; the message/lease survives.
+   A crash after partial S3 writes repeats deterministic PUTs on retry.
+
+Keys are `repositories/{owner__repo}/runs/{run_id}/ingestion.json` and `logs.zip`.
+Different webhook deliveries for the same run intentionally share these keys;
+this class stores one current artifact pair per run, not per rerun attempt.
+S3 bytes can be rewritten during recovery; durable job completion is fenced.
+
+The downloader authenticates only the exact api.github.com endpoint for the
+recorded repository/run, sends Accept and X-GitHub-Api-Version, and follows HTTPS
+GitHub/blob redirects without forwarding Authorization. Default connect/read
+limits are 10/30 seconds, total attempt 180 seconds, raw ZIP limit 25 MiB. Oversize,
+expired, inaccessible, or non-ZIP logs retry and can reach DLQ. Never enable HTTP
+wire/debug logging or print token/signed redirect URL/exception text.
+
+## Docker-only local development and full integration
+
+Prerequisite: Docker Engine/Desktop with Linux containers and Compose v2. No
+host virtual environment, host pip, or host application/test execution is needed.
+From repository root, copy `.env.example` to `.env` (`Copy-Item .env.example .env`
+in PowerShell). Local PostgreSQL credentials and AWS dummy credentials in that
+file are for this isolated stack only. Configure a real GITHUB_TOKEN there only
+when running the real worker; Compose passes it solely to the worker container.
+The test service constructs a mocked downloader and needs no real token.
 
 ```sh
-docker build -t ci-repair:class2 .
-docker run --rm ci-repair:class2 python -m pytest -q -p no:cacheprovider
-docker run --detach --rm --name ci-repair-class2 -e PORT=8080 -p 8080:8080 ci-repair:class2
+cp .env.example .env
+docker compose build api
+docker run --rm ci-repair:class4 python -m pytest -q -m 'not integration' -p no:cacheprovider
+docker compose up -d --wait postgres localstack
+docker compose run --rm migration
+docker compose run --rm migration alembic check
+docker compose up -d --wait api
+docker compose --profile test run --rm test
 ```
 
-From the host, after Uvicorn starts:
+The LocalStack Python READY hook creates ci-repair-events-dlq and ci-repair-events
+with redrive maxReceiveCount=3, long polling=20, visibility=300, and a private
+SSE-S3 bucket. All names, region, URLs and bucket are configurable. AWS_ENDPOINT_URL
+selects LocalStack. `postgres` exposes no host DB port; LocalStack/API bind only
+host loopback. LocalStack resources reset when recreated; PostgreSQL uses a volume.
+Keep .env region, queue URL path and selected names consistent if changing examples.
+
+Tests exercise Alembic schema, API persist+enqueue, old health/ping/ignore/invalid
+contracts, exact extended event/response/log, concurrent duplicate delivery, claims
+and stale tokens, bounded download, both encrypted S3 objects, terminal duplicate
+acknowledgement, GitHub/S3/DB failure retry, and actual LocalStack DLQ redrive.
+The DLQ test shortens visibility only for its isolated test queue/message to avoid
+waiting 300 seconds per attempt. Integration tests truncate the isolated test DB;
+**never point the test service at cloud or production resources**. Run suites
+serially; do not run integration tests against the same DB as a live worker.
+
+After tests, start the real worker with a selected-repository GitHub token:
 
 ```sh
-curl --fail-with-body -i http://localhost:8080/health
-curl --fail-with-body -i -X POST http://localhost:8080/webhook -H 'Content-Type: application/json' -H 'X-GitHub-Event: ping' -H 'X-GitHub-Delivery: local-ping-001' --data '{}'
+docker compose up -d worker
+curl --fail-with-body http://localhost:8080/health
+curl --fail-with-body -X POST http://localhost:8080/webhook -H 'Content-Type: application/json' -H 'X-GitHub-Event: workflow_run' -H 'X-GitHub-Delivery: local-failure-001' --data-binary '@tests/fixtures/workflow_run_failure.json'
+docker compose logs -f worker
 ```
 
-In Windows PowerShell, use `curl.exe` in place of `curl`. Health should return
-200 with `{"status":"ok"}`; ping should return 200 with
-`{"status":"ok","event":"ping"}`.
+Use curl.exe in Windows PowerShell. Fixture run 123 is synthetic; its actual GitHub
+download will fail. Use a real failed workflow delivery for a live demonstration;
+the integration suite covers successful download with a mock and real local DB/SQS/S3.
 
-To exercise an accepted failure from the host:
+`.github/workflows/class2-validation.yml` is extended to Class 4 Docker validation.
+It runs these same containers on a GitHub Linux runner, additionally round-trips
+Alembic downgrade/upgrade and verifies UID 10001 and graceful worker SIGTERM.
+Check the Actions run for actual results; authoring-host Docker is unavailable.
+
+## GitHub token and manual redelivery
+
+Create a fine-grained PAT scoped only to monitored repositories with **Actions:
+read** (metadata read is implicit); approve organization access if required.
+Use an expiring token, store GITHUB_TOKEN only in the worker's secret environment,
+and rotate/revoke it after the demo. A GitHub App installation token with equivalent
+permissions also works but its refresh must be handled operationally. The API,
+migration, SQS message, and event artifact never need the token. Logs may expire
+according to repository retention; confirm the run is still downloadable.
+
+Configure GitHub repository Settings -> Webhooks -> the existing hook: public
+API `/webhook`, JSON, SSL verification enabled, Workflow runs selected. Classroom
+HMAC validation remains deliberately absent.
+GitHub does **not automatically redeliver** failed webhook deliveries. For a 503,
+fix service configuration/permissions, open Settings -> Webhooks -> Recent
+Deliveries -> failed delivery -> **Redeliver** (same delivery ID stays idempotent).
+Alternatively run the operational publisher sweep (up to 100 oldest unenqueued
+queued/retrying jobs; rerun for more):
 
 ```sh
-curl --fail-with-body -i -X POST http://localhost:8080/webhook -H 'Content-Type: application/json' -H 'X-GitHub-Event: workflow_run' -H 'X-GitHub-Delivery: local-failure-001' --data-binary '@tests/fixtures/workflow_run_failure.json'
-docker logs ci-repair-class2
-docker stop ci-repair-class2
+docker compose run --rm --no-deps api python -m worker.retry_enqueue
+docker compose run --rm --no-deps api python -m worker.retry_enqueue --job-id JOB_UUID
 ```
 
-The image runs as an unprivileged numeric user. `EXPOSE 8000` documents the default;
-the start command binds `0.0.0.0` to `${PORT:-8000}`, so `PORT=8080` changes the
-actual listener. No `railway.json` is required.
+It returns nonzero if any job could not publish. After an ambiguous final commit,
+wait for the 120-second enqueue lease to expire before recovery. It intentionally
+uses API credentials and does not need GITHUB_TOKEN or S3. If a job already reached
+ready_for_agent but has no recorded SQS ID, no extra publication is needed; an
+explicit --job-id sweep is safe (the consumer terminal path acknowledges it).
 
-## Manual GitHub and Railway checklist
+## AWS Console setup: RDS PostgreSQL 16
 
-1. Create a **private** GitHub repository in your account. Commit this project's
-   source files and push the branch you intend Railway to deploy. Confirm the
-   repository displays **Private**. Exclude `.env`, `work/`, and `outputs/`.
-2. In Railway, create a project from **GitHub Repo**, authorize access to that
-   private repository, and select it and the deployment branch. Use the repository
-   root as the service root. Confirm Railway detects the root `Dockerfile`; keep
-   the image's start command. No AWS resources or extra services are needed.
-3. Set the service's health-check path to `/health`. Keep Railway's injected
-   `PORT`; the Docker command already reads it and binds to `0.0.0.0`. Deploy and
-   inspect build/startup logs.
-4. Under the service's Settings → Networking, choose **Generate Domain**.
-   Use the listener's port if Railway requests a target port. Confirm the public
-   `https://YOUR-DOMAIN/health` returns 200 and `{"status":"ok"}`.
-5. In the GitHub repository whose workflow runs you want to monitor, open
-   Settings → Webhooks → Add webhook. Set the payload URL to
-   `https://YOUR-DOMAIN/webhook`, content type to `application/json`, and keep SSL
-   verification enabled. Leave Secret empty for this class because validation
-   is deliberately unimplemented. Choose individual events and select
-   **Workflow runs**; leave the webhook active and save it.
-6. Inspect Recent Deliveries: the initial ping should return 200. Run an existing
-   CI workflow, confirm successful runs are ignored, and inspect a completed
-   failed run's delivery for the accepted response and normalized service log.
-   This webhook subscription is separate from a workflow's YAML triggers.
+Cloud setup is manual and can incur charges. Railway hosts **only the API**;
+use real RDS, SQS/DLQ and S3, plus a separate Docker worker host. No cloud resources
+are provisioned by this code.
 
-See [Railway repository and Dockerfile deployment](https://docs.railway.com/services),
-[health checks and PORT](https://docs.railway.com/deployments/healthchecks),
-[public domains](https://docs.railway.com/networking/public-networking), and
-[GitHub webhook setup](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks).
+1. Select an approved AWS region. In VPC -> Security groups create a dedicated RDS
+   group. Allow TCP 5432 only from approved API static egress CIDR(s) and the worker's
+   stable egress /32 or its security group when connected privately. **Never allow
+   0.0.0.0/0 or ::/0 on 5432.** Do not substitute Railway's public inbound domain IP.
+2. In RDS -> Parameter groups -> Create, choose PostgreSQL 16 family; edit
+   `rds.force_ssl=1`. RDS -> Databases -> Create database -> Standard create ->
+   PostgreSQL -> version 16; select your VPC, DB subnet group and dedicated SG,
+   encryption, backups, a small demo instance, and an approved credential source.
+   Associate the custom parameter group and reboot if its change requires it.
+3. Prefer private RDS connectivity through an approved network path. If Railway
+   requires a publicly addressable RDS endpoint for this demo, restrict the SG to
+   its stable outbound IP(s) and worker egress only. Railway static outbound IPs
+   require an eligible plan. If stable approved egress/private connectivity is not
+   available, stop here and arrange it; never open the DB to the world.
+4. Wait for Available. Copy the DNS endpoint/port from Connectivity & security.
+   Download AWS's RDS CA bundle from the official RDS certificate documentation.
+   Mount it read-only into migration/API/worker containers. Set
+   DATABASE_URL=`postgresql+asyncpg://USER:URL_ENCODED_PASSWORD@RDS_DNS:5432/DB`,
+   DATABASE_SSL=true, DATABASE_SSL_CA to that mounted path. Do not use `sslmode`
+   query parameters. The code verifies the certificate and endpoint hostname.
+5. Use a migration-only DB owner. From the approved network, run the image with a
+   restricted migration env file and the CA mount:
 
-## Class 3 handoff
-
-In `app/main.py`, `webhook()` constructs the validated `failure: FailureEvent`
-and logs it. **Immediately after that log, before returning the accepted
-response**, the exact non-executing integration placeholders are:
-
-```python
-# PostgreSQL placeholder — implement in Class 3:
-# await failure_repository.create(failure)
-# AWS SQS placeholder — implement in Class 3:
-# await queue_publisher.publish(failure)
+```sh
+docker run --rm --env-file /secure/migration.env --mount type=bind,src=/secure/rds-ca.pem,dst=/certs/rds-ca.pem,readonly ci-repair:class4 alembic upgrade head
+docker run --rm --env-file /secure/migration.env --mount type=bind,src=/secure/rds-ca.pem,dst=/certs/rds-ca.pem,readonly ci-repair:class4 alembic check
 ```
 
-Class 3 should introduce the publisher there and serialize the normalized
-`FailureEvent`, rather than forwarding the raw GitHub payload. It must define
-durable acknowledgement, retry/error behavior, and delivery-ID idempotency before
-claiming reliable ingestion. Repair work belongs in the future consumer. These
-comments do not persist or enqueue anything today.
+Create separate API and worker DB login roles and grant only CONNECT, schema USAGE,
+and required SELECT/INSERT/UPDATE on repair_jobs (worker needs SELECT/UPDATE; API
+needs SELECT/INSERT/UPDATE). Neither runtime login needs DDL, table deletion or
+migration ownership. Store connection secrets outside git; do not echo them.
 
-## Verification status for this workspace
+## AWS Console setup: SQS/DLQ and private S3
 
-The test suite covers health, ping, unsupported events, requested/in-progress
-runs, ignored completed conclusions, every accepted failure conclusion, exact
-normalization and log content, missing/empty headers, malformed JSON/encoding,
-missing required fields, and malformed workflow-run types.
+1. SQS -> Queues -> Create queue -> **Standard**, create ci-repair-events-dlq
+   first; choose SSE-SQS and a retention period longer than the source (e.g. 14 days).
+2. Create ci-repair-events as Standard with Visibility timeout **300 seconds**,
+   Receive message wait time **20 seconds**, SSE-SQS, and an appropriate source
+   retention (e.g. 4 days). Under Dead-letter queue, enable redrive, select the DLQ,
+   set Maximum receives **3**. On DLQ redrive allow policy, allow only this source
+   queue. Record the queue URL and both ARNs in your private deployment config.
+3. S3 -> Buckets -> Create bucket -> unique configured name in the chosen region.
+   Leave **all Block Public Access settings on**, Object Ownership **Bucket owner
+   enforced** (ACLs disabled), and default encryption **SSE-S3**. No public bucket
+   policy, ACL, website hosting or signed artifact links are created by the app.
+   Optionally add a short lifecycle expiration for demo artifacts.
+4. Add a bucket policy denying insecure transport (`aws:SecureTransport=false`).
+   Restrict the worker's PutObject permission to the repositories/ prefix and,
+   optionally, require s3:x-amz-server-side-encryption=AES256. The adapter explicitly
+   sends AES256 on both writes. Use separate operator read/delete access.
 
-Docker is unavailable on the local authoring machine. The additional
-`.github/workflows/class2-validation.yml` runs the same image build, container
-pytest, PORT=8080 startup, exact host curl response checks, and container cleanup
-on GitHub's hosted Linux runner for pull requests. Check the PR's Actions result
-for the verified outcome. No Python dependencies are installed on either host.
-Railway deployment and a live GitHub webhook require the manual account setup
-above.
+## Least-privilege credentials and Railway variables
+
+For temporary Railway-to-AWS access, create a **dedicated API IAM principal** with
+only sqs:SendMessage on the **one source queue ARN**, and no S3, DLQ, receive,
+delete, admin or wildcard resource privileges. Use a separate worker principal.
+Create scoped policies in IAM -> Policies -> Create policy, then assign them to
+the relevant role/user. If a static key is necessary, IAM -> Users -> selected
+dedicated user -> Security credentials -> Create access key; keep it in the
+service's secret variables, never source, logs, queue or README. Rotate and delete
+temporary credentials after the demo. Class 8 replaces static worker credentials
+with **EKS IRSA**; this class does not implement IRSA.
+
+| Principal | Runtime IAM actions | Resource scope |
+| --- | --- | --- |
+| API / enqueue recovery | sqs:SendMessage | Source queue ARN |
+| Worker | sqs:ReceiveMessage, sqs:DeleteMessage | Source queue ARN |
+| Worker | s3:PutObject | `arn:aws:s3:::YOUR_BUCKET/repositories/*` |
+| Operator only | SQS inspect/redrive, S3 read/delete as needed | Named queues/bucket |
+
+No runtime AWS queue/bucket create, listing, purge, DLQ receive or bucket admin
+permission is needed. The worker sets visibility on receive and does not call
+ChangeMessageVisibility. For customer-managed KMS, additional key grants would
+be needed; this class uses SSE-SQS and SSE-S3 instead. LocalStack's dummy credentials
+are not a substitute for a real-AWS IAM audit.
+
+In Railway -> your project -> **API service** -> Variables configure:
+
+| Variable | API | Worker Docker host |
+| --- | --- | --- |
+| DATABASE_URL (separate least-privilege DB role) | Required | Required |
+| DATABASE_SSL=true, DATABASE_SSL_CA | Required | Required |
+| AWS_REGION | Required | Required |
+| AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (or approved role credentials) | API principal | Worker principal |
+| AWS_SESSION_TOKEN | Only for temporary STS credentials | Only for temporary STS credentials |
+| SQS_QUEUE_URL | Real source URL | Same source URL |
+| S3_BUCKET | Not needed | Required |
+| GITHUB_TOKEN | **Do not set** | Required |
+| AWS_ENDPOINT_URL | **Unset** | **Unset** |
+| PORT | Railway-injected | Not needed |
+
+Make the official CA bundle available at DATABASE_SSL_CA in Railway via an
+approved read-only mount or a small deployment-image layer copied from a verified
+local CA bundle. The generic image does not silently download trust material at
+startup. Set Railway healthcheck `/health`, root Dockerfile, and the image's
+normal start command. Run Alembic once from the approved network before routing
+webhooks to the Class 4 deployment. Switch the Railway deployment branch only
+after DB/networking/secrets are configured; the Class 2 service can remain active
+while you review this feature branch. No worker service is hosted on Railway.
+
+## Worker runbook, DLQ recovery, teardown
+
+Build/pull the same reviewed image on an approved Docker host with stable egress.
+Use a permission-restricted worker env file and CA mount:
+
+```sh
+docker run -d --name ci-repair-worker --init --restart unless-stopped --stop-timeout 240 --env-file /secure/worker.env --mount type=bind,src=/secure/rds-ca.pem,dst=/certs/rds-ca.pem,readonly ci-repair:class4 python -m worker.main
+docker logs -f ci-repair-worker
+docker stop -t 240 ci-repair-worker
+```
+
+SIGTERM/SIGINT stop new receives and finish the current bounded attempt/poll.
+Allow 240 seconds before force kill. A hard kill leaves the message unacknowledged;
+the DB lease and SQS visibility expire. Database outages may delay retry recording.
+Watch structured job_id/message_id/stage logs, retry_count, rows with no SQS ID,
+age of queued/processing rows, DLQ visible count, and worker container liveness.
+Never copy raw logs or credentials into operational log messages.
+
+For inspection, open SQS -> DLQ -> Send and receive messages -> Poll for messages
+with a separate operator identity; receiving there affects receive count/visibility.
+Identify job_id from a valid envelope, inspect the database and sanitized error,
+fix token/expired logs/S3/IAM/network problems, then use DLQ -> **Start DLQ redrive**
+to source queue at a controlled rate. Operator redrive typically needs
+sqs:StartMessageMoveTask, sqs:ReceiveMessage, sqs:DeleteMessage,
+sqs:GetQueueAttributes on DLQ and sqs:SendMessage on source; add permissions for
+customer-managed keys only if used. Malformed envelopes need correction/republication
+by an operator; blindly redriving them repeats the failure. DLQ messages with no
+valid job ID cannot update a DB row. Do not delete messages until evidence/recovery
+is recorded. To abandon a valid job, mark failed explicitly through an approved
+DB operator procedure; failed is terminal and subsequent deliveries acknowledge it.
+
+Local teardown (deletes this disposable stack's PostgreSQL volume):
+
+```sh
+docker compose --profile test down -v --remove-orphans
+```
+
+Cloud teardown: disable the demo GitHub hook; stop the Docker worker and API;
+retain any required evidence; remove demo S3 objects/bucket, source queue/DLQ,
+RDS instance and unneeded final snapshots/backups, SG rules and temporary IAM
+keys/principals. Delete only named demo resources after checking ownership/retention.
+
+## References
+
+- [GitHub workflow-run log download and token permissions](https://docs.github.com/en/rest/actions/workflow-runs#download-workflow-run-logs)
+- [GitHub handling failed webhook deliveries](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks)
+- [SQS visibility and at-least-once delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)
+- [RDS PostgreSQL TLS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html)
+- [RDS security groups](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.RDSSecurityGroups.html)
+- [Railway static outbound IPs](https://docs.railway.com/networking/static-outbound-ips)
+- [LocalStack initialization hooks](https://docs.localstack.cloud/aws/customization/advanced/initialization-hooks/)

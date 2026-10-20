@@ -2,6 +2,7 @@
   "action": "completed",
   "repository": {
     "full_name": "octocat/ci-repair-example",
+    "clone_url": "https://github.com/octocat/ci-repair-example.git",
     "private": true
   },
   "workflow_run": {

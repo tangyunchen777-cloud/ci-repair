@@ -1,7 +1,9 @@
-name: Class 2 Docker validation
+name: Class 4 Docker validation
 
 on:
   pull_request:
+  push:
+    branches: [class4-durable-ingestion]
 
 permissions:
   contents: read
@@ -9,30 +11,44 @@ permissions:
 jobs:
   docker-validation:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Build Python 3.12 image
-        run: docker build -t ci-repair:class2 .
-      - name: Run pytest inside a temporary container
-        run: docker run --rm ci-repair:class2 python -m pytest -q -p no:cacheprovider
-      - name: Verify PORT=8080, health, and webhook ping from runner host
-        shell: bash
+      - name: Build one Python 3.12 application image
         run: |
-          set -euo pipefail
-          docker run --detach --rm --name ci-repair-class2 -e PORT=8080 -p 8080:8080 ci-repair:class2
-          trap 'docker logs ci-repair-class2; docker stop ci-repair-class2' EXIT
-          for attempt in {1..30}; do
-            if curl --fail --silent http://localhost:8080/health >/dev/null; then break; fi
-            sleep 1
-          done
-          health_status=$(curl --silent --show-error -o /tmp/health.json -w '%{http_code}' http://localhost:8080/health)
-          test "$health_status" = 200
-          test "$(cat /tmp/health.json)" = '{"status":"ok"}'
-          cat /tmp/health.json
-          ping_status=$(curl --silent --show-error -o /tmp/ping.json -w '%{http_code}' -X POST http://localhost:8080/webhook -H 'Content-Type: application/json' -H 'X-GitHub-Event: ping' -H 'X-GitHub-Delivery: ci-ping-001' --data '{}')
-          test "$ping_status" = 200
-          test "$(cat /tmp/ping.json)" = '{"status":"ok","event":"ping"}'
-          cat /tmp/ping.json
+          cp .env.example .env
+          docker compose build api
+      - name: Run unit and preserved Class 2 contract tests in Docker
+        run: docker run --rm ci-repair:class4 python -m pytest -q -m 'not integration' -p no:cacheprovider
+      - name: Start healthy PostgreSQL 16 and LocalStack
+        run: docker compose up -d --wait postgres localstack
+      - name: Exercise Alembic upgrade, downgrade, upgrade, and schema check
+        run: |
+          docker compose run --rm migration
+          docker compose run --rm migration alembic downgrade base
+          docker compose run --rm migration
+          docker compose run --rm migration alembic check
+      - name: Start API on PORT=8080
+        run: docker compose up -d --wait api
+      - name: Run full Compose integration suite
+        run: docker compose --profile test run --rm test
+      - name: Verify unprivileged image and graceful worker SIGTERM
+        run: |
+          test "$(docker compose run --rm --no-deps api id -u)" = 10001
+          docker compose run --no-deps -d --name ci-repair-worker-smoke -e GITHUB_TOKEN=unused-smoke-token worker
+          sleep 3
+          test "$(docker inspect -f '{{.State.Running}}' ci-repair-worker-smoke)" = true
+          docker stop -t 240 ci-repair-worker-smoke
+          test "$(docker inspect -f '{{.State.ExitCode}}' ci-repair-worker-smoke)" = 0
+      - name: Show container logs
+        if: always()
+        run: |
+          docker compose logs --no-color
+          docker logs ci-repair-worker-smoke 2>/dev/null || true
+      - name: Remove isolated test containers and volumes
+        if: always()
+        run: |
+          docker rm -f ci-repair-worker-smoke 2>/dev/null || true
+          docker compose --profile test down -v --remove-orphans
