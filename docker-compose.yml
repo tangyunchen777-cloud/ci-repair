@@ -35,6 +35,10 @@ services:
     environment:
       SERVICES: sqs,s3
       AWS_DEFAULT_REGION: ${AWS_REGION:?Set AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set local credentials}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set local credentials}
+      BOOTSTRAP_AWS_ENDPOINT_URL: http://localhost:4566
+      LOCALSTACK_HOST: localstack:4566
       SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:?Set SQS_QUEUE_NAME}
       SQS_DLQ_NAME: ${SQS_DLQ_NAME:?Set SQS_DLQ_NAME}
       S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET}
